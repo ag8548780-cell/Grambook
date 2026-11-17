@@ -1,0 +1,603 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const http = require('http');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { WebSocketServer, WebSocket } = require('ws');
+
+const PORT = Number(process.env.PORT || 4000);
+const JWT_SECRET = process.env.JWT_SECRET || 'grambook_dev_secret_change_me';
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'grambook_refresh_secret_change_me';
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
+const NTFY_BASE_URL = process.env.NTFY_BASE_URL || '';
+const DB_FILE = path.resolve(__dirname, 'grambook.db');
+const UPLOAD_DIR = path.resolve(__dirname, 'uploads');
+
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// ---------------- SQLite डेटाबेस (Termux-सुरक्षित: node:sqlite या sql.js) ----------------
+let dbDriver = null;
+
+async function initDatabase() {
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    const nativeDb = new DatabaseSync(DB_FILE);
+    nativeDb.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+    dbDriver = {
+      exec: (sql) => nativeDb.exec(sql),
+      run: (sql, params = []) => nativeDb.prepare(sql).run(...params),
+      get: (sql, params = []) => nativeDb.prepare(sql).get(...params),
+      all: (sql, params = []) => nativeDb.prepare(sql).all(...params),
+    };
+    console.log('[DB] बिल्ट-इन node:sqlite चालू हो गया।');
+  } catch {
+    const initSqlJs = require('sql.js');
+    const SQL = await initSqlJs();
+    const fileBuf = fs.existsSync(DB_FILE) ? fs.readFileSync(DB_FILE) : null;
+    const sqlDb = fileBuf ? new SQL.Database(fileBuf) : new SQL.Database();
+    sqlDb.exec('PRAGMA foreign_keys = ON;');
+    let flushTimer = null;
+    const flushDisk = () => {
+      clearTimeout(flushTimer);
+      flushTimer = setTimeout(() => {
+        try {
+          fs.writeFileSync(DB_FILE, Buffer.from(sqlDb.export()));
+        } catch (e) {
+          console.error('[DB Save Error]', e.message);
+        }
+      }, 150);
+    };
+    dbDriver = {
+      exec: (sql) => { sqlDb.exec(sql); flushDisk(); },
+      run: (sql, params = []) => { sqlDb.run(sql, params); flushDisk(); },
+      get: (sql, params = []) => {
+        const stmt = sqlDb.prepare(sql);
+        stmt.bind(params);
+        const row = stmt.step() ? stmt.getAsObject() : undefined;
+        stmt.free();
+        return row;
+      },
+      all: (sql, params = []) => {
+        const stmt = sqlDb.prepare(sql);
+        stmt.bind(params);
+        const rows = [];
+        while (stmt.step()) rows.push(stmt.getAsObject());
+        stmt.free();
+        return rows;
+      },
+    };
+    console.log('[DB] शुद्ध JS sql.js SQLite चालू हो गया।');
+  }
+
+  dbDriver.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      public_uid TEXT UNIQUE NOT NULL,
+      phone TEXT UNIQUE NOT NULL,
+      username TEXT UNIQUE NOT NULL,
+      full_name TEXT NOT NULL,
+      email TEXT DEFAULT '',
+      password_hash TEXT NOT NULL,
+      dob TEXT DEFAULT '',
+      bio TEXT DEFAULT '',
+      avatar_url TEXT DEFAULT '',
+      cover_url TEXT DEFAULT '',
+      is_private INTEGER DEFAULT 0,
+      is_verified INTEGER DEFAULT 0,
+      is_creator INTEGER DEFAULT 0,
+      role TEXT DEFAULT 'user',
+      status TEXT DEFAULT 'active',
+      who_can_comment TEXT DEFAULT 'everyone',
+      who_can_message TEXT DEFAULT 'everyone',
+      who_can_tag TEXT DEFAULT 'everyone',
+      default_post_visibility TEXT DEFAULT 'public',
+      hide_profile_visits INTEGER DEFAULT 0,
+      theme_mode TEXT DEFAULT 'light',
+      language TEXT DEFAULT 'hi',
+      data_saver INTEGER DEFAULT 0,
+      autoplay_videos INTEGER DEFAULT 1,
+      notify_likes INTEGER DEFAULT 1,
+      notify_comments INTEGER DEFAULT 1,
+      notify_messages INTEGER DEFAULT 1,
+      is_online INTEGER DEFAULT 0,
+      last_seen INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      refresh_token_hash TEXT NOT NULL,
+      device_name TEXT DEFAULT 'Android',
+      ip_address TEXT DEFAULT '',
+      expires_at INTEGER NOT NULL,
+      revoked INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS follows (
+      follower_id TEXT NOT NULL,
+      following_id TEXT NOT NULL,
+      status TEXT DEFAULT 'accepted',
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (follower_id, following_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS friendships (
+      requester_id TEXT NOT NULL,
+      addressee_id TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (requester_id, addressee_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS close_friends (
+      user_id TEXT NOT NULL,
+      friend_id TEXT NOT NULL,
+      PRIMARY KEY (user_id, friend_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS blocks (
+      blocker_id TEXT NOT NULL,
+      blocked_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (blocker_id, blocked_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS music_tracks (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      artist TEXT NOT NULL,
+      audio_url TEXT NOT NULL,
+      duration_sec INTEGER DEFAULT 30,
+      license_name TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS posts (
+      id TEXT PRIMARY KEY,
+      author_id TEXT NOT NULL,
+      idempotency_key TEXT UNIQUE,
+      post_kind TEXT DEFAULT 'standard',
+      caption TEXT DEFAULT '',
+      location TEXT DEFAULT '',
+      hashtags_json TEXT DEFAULT '[]',
+      tagged_ids_json TEXT DEFAULT '[]',
+      allow_download INTEGER DEFAULT 1,
+      visibility TEXT DEFAULT 'public',
+      reposted_from_id TEXT DEFAULT '',
+      music_track_id TEXT DEFAULT '',
+      local_audio_title TEXT DEFAULT '',
+      music_start_sec INTEGER DEFAULT 0,
+      music_volume INTEGER DEFAULT 70,
+      original_volume INTEGER DEFAULT 80,
+      youtube_video_id TEXT DEFAULT '',
+      youtube_title TEXT DEFAULT '',
+      youtube_thumbnail TEXT DEFAULT '',
+      is_draft INTEGER DEFAULT 0,
+      publish_at INTEGER NOT NULL,
+      likes_count INTEGER DEFAULT 0,
+      comments_count INTEGER DEFAULT 0,
+      views_count INTEGER DEFAULT 0,
+      shares_count INTEGER DEFAULT 0,
+      is_deleted INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS post_media (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      media_url TEXT NOT NULL,
+      media_type TEXT NOT NULL,
+      filter_name TEXT DEFAULT 'normal',
+      sort_order INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS post_likes (
+      post_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      PRIMARY KEY (post_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS post_comments (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      parent_comment_id TEXT DEFAULT '',
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS post_saves (
+      post_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      PRIMARY KEY (post_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS post_polls (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      question TEXT NOT NULL,
+      options_json TEXT NOT NULL,
+      correct_index INTEGER DEFAULT -1
+    );
+
+    CREATE TABLE IF NOT EXISTS poll_votes (
+      poll_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      option_index INTEGER NOT NULL,
+      PRIMARY KEY (poll_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS reels (
+      id TEXT PRIMARY KEY,
+      author_id TEXT NOT NULL,
+      idempotency_key TEXT UNIQUE,
+      video_url TEXT NOT NULL,
+      thumbnail_url TEXT DEFAULT '',
+      caption TEXT DEFAULT '',
+      music_track_id TEXT DEFAULT '',
+      music_start_sec INTEGER DEFAULT 0,
+      music_volume INTEGER DEFAULT 70,
+      original_volume INTEGER DEFAULT 80,
+      reposted_from_id TEXT DEFAULT '',
+      likes_count INTEGER DEFAULT 0,
+      comments_count INTEGER DEFAULT 0,
+      views_count INTEGER DEFAULT 0,
+      is_deleted INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reel_likes (
+      reel_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      PRIMARY KEY (reel_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS reel_comments (
+      id TEXT PRIMARY KEY,
+      reel_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reel_saves (
+      reel_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      PRIMARY KEY (reel_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS stories (
+      id TEXT PRIMARY KEY,
+      author_id TEXT NOT NULL,
+      media_url TEXT DEFAULT '',
+      media_type TEXT NOT NULL,
+      text_overlay TEXT DEFAULT '',
+      bg_color TEXT DEFAULT '#FF5A36',
+      stickers_json TEXT DEFAULT '[]',
+      music_track_id TEXT DEFAULT '',
+      music_start_sec INTEGER DEFAULT 0,
+      youtube_video_id TEXT DEFAULT '',
+      youtube_title TEXT DEFAULT '',
+      privacy TEXT DEFAULT 'followers',
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS story_views (
+      story_id TEXT NOT NULL,
+      viewer_id TEXT NOT NULL,
+      liked INTEGER DEFAULT 0,
+      viewed_at INTEGER NOT NULL,
+      PRIMARY KEY (story_id, viewer_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS story_replies (
+      id TEXT PRIMARY KEY,
+      story_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      message TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS story_highlights (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      cover_url TEXT DEFAULT '',
+      story_ids_json TEXT DEFAULT '[]',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS communities (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      photo_url TEXT DEFAULT '',
+      privacy TEXT DEFAULT 'public',
+      is_broadcast INTEGER DEFAULT 0,
+      creator_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS community_members (
+      community_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT DEFAULT 'member',
+      joined_at INTEGER NOT NULL,
+      PRIMARY KEY (community_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS community_posts (
+      id TEXT PRIMARY KEY,
+      community_id TEXT NOT NULL,
+      author_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      media_url TEXT DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chats (
+      id TEXT PRIMARY KEY,
+      is_group INTEGER DEFAULT 0,
+      group_name TEXT DEFAULT '',
+      group_photo TEXT DEFAULT '',
+      created_by TEXT DEFAULT '',
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_members (
+      chat_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT DEFAULT 'member',
+      is_pinned INTEGER DEFAULT 0,
+      is_muted INTEGER DEFAULT 0,
+      is_archived INTEGER DEFAULT 0,
+      PRIMARY KEY (chat_id, user_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      msg_type TEXT DEFAULT 'text',
+      content TEXT DEFAULT '',
+      media_url TEXT DEFAULT '',
+      file_name TEXT DEFAULT '',
+      reply_to_id TEXT DEFAULT '',
+      forwarded_from_id TEXT DEFAULT '',
+      reactions_json TEXT DEFAULT '{}',
+      seen_by_json TEXT DEFAULT '[]',
+      is_edited INTEGER DEFAULT 0,
+      is_deleted INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS calls (
+      id TEXT PRIMARY KEY,
+      caller_id TEXT NOT NULL,
+      callee_ids_json TEXT NOT NULL,
+      chat_id TEXT DEFAULT '',
+      call_type TEXT NOT NULL,
+      is_group INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'ringing',
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS live_streams (
+      id TEXT PRIMARY KEY,
+      host_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT DEFAULT 'live',
+      guest_ids_json TEXT DEFAULT '[]',
+      viewers_count INTEGER DEFAULT 0,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS live_comments (
+      id TEXT PRIMARY KEY,
+      live_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      actor_id TEXT DEFAULT '',
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      target_id TEXT DEFAULT '',
+      is_read INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY,
+      reporter_id TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      admin_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target_id TEXT DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS server_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      level TEXT NOT NULL,
+      route TEXT DEFAULT '',
+      message TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `);
+
+  // प्रारंभिक म्यूज़िक ट्रैक व डिफ़ॉल्ट एडमिन अकाउंट (यदि पहले से न हो)
+  const trackCount = dbDriver.get('SELECT COUNT(*) AS c FROM music_tracks').c;
+  if (trackCount === 0) {
+    dbDriver.run('INSERT INTO music_tracks VALUES (?,?,?,?,?,?)', ['trk_1', 'सुबह की धुन', 'ग्रामबुक स्टूडियो', '/uploads/music/morning.mp3', 45, 'Royalty Free CC-BY']);
+    dbDriver.run('INSERT INTO music_tracks VALUES (?,?,?,?,?,?)', ['trk_2', 'लोफ़ी नाइट्स', 'देसी बीट्स', '/uploads/music/lofi.mp3', 60, 'Royalty Free CC-BY']);
+    dbDriver.run('INSERT INTO music_tracks VALUES (?,?,?,?,?,?)', ['trk_3', 'उत्सव ढोल', 'लोक संगीत', '/uploads/music/dhol.mp3', 35, 'Royalty Free CC-BY']);
+  }
+
+  const adminExists = dbDriver.get("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+  if (!adminExists) {
+    const hash = bcrypt.hashSync('admin123', 10);
+    dbDriver.run(
+      `INSERT INTO users (id, public_uid, phone, username, full_name, email, password_hash, bio, is_verified, role, created_at)
+       VALUES (?,?,?,?,?,?,?,?,1,'admin',?)`,
+      ['u_admin', 'GBADMIN1', '9000000000', 'admin', 'GRAMBOOK एडमिन', 'admin@grambook.local', hash, 'सिस्टम व्यवस्थापक', Date.now()]
+    );
+  }
+}
+
+// ---------------- हेल्पर्स, अपलोड, WebSocket और पुश ----------------
+const uid = (prefix = '') => prefix + crypto.randomUUID();
+const safeJson = (raw, fallback) => { try { return JSON.parse(raw); } catch { return fallback; } };
+const socketsByUser = new Map();
+
+function emitToUser(userId, event, payload) {
+  const set = socketsByUser.get(userId);
+  if (!set) return;
+  const msg = JSON.stringify({ event, payload });
+  for (const ws of set) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  }
+}
+
+function sendNotification({ userId, actorId = '', type, title, body, targetId = '' }) {
+  if (!userId || userId === actorId) return;
+  const id = uid('notif_');
+  const now = Date.now();
+  dbDriver.run(
+    'INSERT INTO notifications (id, user_id, actor_id, type, title, body, target_id, created_at) VALUES (?,?,?,?,?,?,?,?)',
+    [id, userId, actorId, type, title, body, targetId, now]
+  );
+  const row = dbDriver.get('SELECT * FROM notifications WHERE id = ?', [id]);
+  emitToUser(userId, 'notification', row);
+
+  if (NTFY_BASE_URL) {
+    fetch(`${NTFY_BASE_URL.replace(/\/$/, '')}/grambook_${userId.replace(/[^a-zA-Z0-9]/g, '')}`, {
+      method: 'POST',
+      headers: { Title: title },
+      body,
+    }).catch(() => {});
+  }
+}
+
+function issueTokens(userId, role) {
+  const accessToken = jwt.sign({ userId, role }, JWT_SECRET, { expiresIn: '7d' });
+  const refreshToken = jwt.sign({ userId, role }, JWT_REFRESH_SECRET, { expiresIn: '60d' });
+  return { accessToken, refreshToken };
+}
+
+function sanitizeUser(u) {
+  if (!u) return null;
+  const { password_hash, ...safe } = u;
+  return safe;
+}
+
+// स्पैम रेट लिमिटर और Auth मिडलवेयर
+const rateMap = new Map();
+function rateLimit(maxPerMin) {
+  return (req, res, next) => {
+    const key = `${req.ip}:${req.path}`;
+    const now = Date.now();
+    const b = rateMap.get(key);
+    if (!b || b.resetAt < now) {
+      rateMap.set(key, { count: 1, resetAt: now + 60000 });
+      return next();
+    }
+    b.count += 1;
+    if (b.count > maxPerMin) return res.status(429).json({ error: 'बहुत अधिक प्रयास! कृपया 1 मिनट बाद पुनः प्रयास करें।' });
+    next();
+  };
+}
+
+function requireAuth(req, res, next) {
+  const h = req.headers.authorization;
+  if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ error: 'कृपया पहले लॉगिन करें।' });
+  try {
+    const dec = jwt.verify(h.slice(7), JWT_SECRET);
+    const u = dbDriver.get('SELECT status, role FROM users WHERE id = ?', [dec.userId]);
+    if (!u || u.status !== 'active') return res.status(403).json({ error: 'यह अकाउंट सक्रिय नहीं है या सस्पेंड है।' });
+    req.authUser = { userId: dec.userId, role: u.role };
+    next();
+  } catch {
+    return res.status(401).json({ error: 'सेशन समाप्त हो गया है। पुनः लॉगिन करें।' });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.authUser.role !== 'admin') return res.status(403).json({ error: 'यह अधिकार केवल एडमिन के पास है।' });
+    next();
+  });
+}
+
+// ---------------- Express ऐप और फ़ाइल अपलोड ----------------
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use('/uploads', express.static(UPLOAD_DIR));
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const folder = String(req.query.folder || 'general').replace(/[^a-zA-Z0-9_-]/g, '');
+    const dir = path.join(UPLOAD_DIR, folder);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}_${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '')}`);
+  },
+});
+const upload = multer({ storage, limits: { fileSize: 60 * 1024 * 1024 } });
+
+app.get('/health', (req, res) => res.json({ ok: true, service: 'GRAMBOOK SQLite API', time: Date.now() }));
+
+app.post('/media/upload', requireAuth, upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'कोई फ़ाइल प्राप्त नहीं हुई।' });
+  const folder = String(req.query.folder || 'general').replace(/[^a-zA-Z0-9_-]/g, '');
+  const host = `${req.protocol}://${req.get('host')}`;
+  res.json({
+    ok: true,
+    url: `${host}/uploads/${folder}/${req.file.filename}`,
+    mimeType: req.file.mimetype,
+    fileName: req.file.originalname,
+  });
+});
+
+// ---------------- 1. रजिस्ट्रेशन, लॉगिन, पासवर्ड रिकवरी ----------------
+app.post('/auth/register', rateLimit(20), (req, res) => {
+  const { fullName, username, phone, password, dob = '', email = '', bio = '', avatarUrl = '' } = req.body || {};
+  if (!fullName?.trim() || !username?.trim() || !phone?.trim() || !password) {
+    return res.status(400).json({ error: 'पूरा नाम, यूज़रनेम, मोबाइल नंबर और पासवर्ड अनिवार्य हैं।' });
+  }
+  const cleanUser = username.trim().toLowerCase().replace(/[^a-z0-9._]/g, '');
+  if (cleanUser.length < 3) return res.status(400).
